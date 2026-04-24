@@ -33,6 +33,12 @@ Bu proje, panoramik dental röntgen görüntülerinde diş çürüklerini tespit
 3. Uygulamayı başlatın:
    python main_ui.py
 
+## Arayüz Sonuç Videosu 
+
+  Aşağıdaki linkten arayüzün videosuna ulaşılabilir.
+  
+https://drive.google.com/file/d/1x19GuWzYpmIhI4eUXznRHFHetKBwAiXt/view?usp=drive_link 
+
 ## 📊 Performans ve Metrik Analizi
 
 Projenin başarısı, test veri seti üzerinde standart tıbbi görüntüleme metrikleri kullanılarak ölçülmüştür. Hibrit modelimiz, sadece ML veya sadece kural tabanlı sistemlere göre daha dengeli sonuçlar vermektedir.
