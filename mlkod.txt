@@ -1,0 +1,2387 @@
+# ============================================================
+# BÖLÜM 1: IMPORTS & CONFIG
+# ============================================================
+
+# --- Standart Kütüphaneler ---
+import os
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- Sayısal & Görsel ---
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from PIL import Image
+
+# --- PyTorch ---
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+# --- MONAI ---
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    ScaleIntensityd,
+    RandFlipd,
+    RandRotated,
+    RandZoomd,
+    RandGaussianNoised,
+    RandAdjustContrastd,
+    ToTensord,
+    ResizeD,
+)
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
+
+# --- EfficientNet (transfer learning) ---
+from torchvision.models import efficientnet_b4, EfficientNet_B4_Weights
+
+# --- Sklearn (metrik hesaplama) ---
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ============================================================
+# DEVICE
+# ============================================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Kullanılan cihaz: {DEVICE}")
+
+# ============================================================
+# DOSYA YOLLARI (Colab/Drive için güncellendi)
+# ============================================================
+import os
+
+# ==========================================
+# 1. VERİ OKUMA YOLLARI (Kaggle Input - Salt Okunur)
+# ==========================================
+import os
+
+# ==========================================
+# 1. GİRDİ YOLLARI (Kaggle Input - Sadece Okuma)
+# ==========================================
+
+# Eğitim (Train) Yolları
+TRAIN_IMAGE_DIR = "/kaggle/input/datasets/abdullahgrm/dental/images/images"
+TRAIN_MASK_DIR  = "/kaggle/input/datasets/abdullahgrm/dental/masks/masks"
+
+# Doğrulama (Validation) Yolları (Eğer bunda da çift klasör varsa masks_val/masks_val yapmıştık)
+VAL_IMAGE_DIR = "/kaggle/input/datasets/abdullahgrm/dental/images_val" 
+VAL_MASK_DIR  = "/kaggle/input/datasets/abdullahgrm/dental/masks_val/masks_val" 
+
+# Test Yolları - İŞTE BURASI DÜZELDİ
+TEST_IMAGE_DIR = "/kaggle/input/datasets/abdullahgrm/dental/test_images/test_images"
+TEST_MASK_DIR  = "/kaggle/input/datasets/abdullahgrm/dental/test_masks/test_masks"
+# Bu yol, içindeki 'checkpoints' ve 'outputs' klasörlerine ulaşmanı sağlar
+CHECKPOINT_INPUT_BASE = "/kaggle/input/datasets/abdullahgrm/checkpoints/checkpoints-20260419T131428Z-3-001/checkpoints"
+
+import os
+
+# ==========================================
+# 1. MODEL YÜKLEME (Giriş - Read Only)
+# ==========================================
+# Kaggle'dan kopyaladığınız tam yolu buraya yazın
+CHECKPOINT_INPUT_DIR = "/kaggle/input/datasets/abdullahgrm/checkpoints/checkpoints-20260419T131428Z-3-001"
+
+# Eğer dosya doğrudan bu klasörün içindeyse:
+LOAD_CHECKPOINT_PATH = os.path.join(CHECKPOINT_INPUT_DIR, "checkpoints", "epoch_20.pth")
+
+# KONTROL: Dosya gerçekten orada mı?
+if os.path.exists(LOAD_CHECKPOINT_PATH):
+    print(f"[OK] Checkpoint bulundu: {LOAD_CHECKPOINT_PATH}")
+else:
+    print(f"[HATA] Dosya bulunamadı! Lütfen yolu kontrol edin: {LOAD_CHECKPOINT_PATH}")
+    # Klasörün içindekileri listeleyip doğru ismi görelim:
+    if os.path.exists(CHECKPOINT_INPUT_DIR):
+        print("Klasör içindeki dosyalar:", os.listdir(CHECKPOINT_INPUT_DIR))
+
+
+# ==========================================
+# 2. ÇIKTI YOLLARI (Yazılabilir - Working)
+# ==========================================
+CHECKPOINT_DIR = "/kaggle/working/checkpoints"
+OUTPUT_DIR     = "/kaggle/working/outputs"
+
+# KRİTİK ADIM: Klasörler yoksa oluştur (Yoksa save_checkpoint hata verir)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"[INFO] Çıktılar buraya kaydedilecek: {CHECKPOINT_DIR}")
+
+# Klasörleri oluştur (Yoksa Python 'Klasör bulunamadı' diyerek hata verir)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ============================================================
+# HYPERPARAMETRELERi
+# ============================================================
+
+# Görüntü
+IMG_SIZE    = 512           # Orijinal boyut korunuyor
+
+# Eğitim
+BATCH_SIZE  = 4             # CPU için güvenli değer
+NUM_EPOCHS  = 25            # 20-30 arası
+LR          = 1e-4          # Başlangıç learning rate
+LR_MIN      = 1e-6          # Cosine scheduler minimum
+WEIGHT_DECAY= 1e-5
+
+# Veri bölme (train/val içinden)
+VAL_SPLIT   = 0.15          # %15 validasyon
+TEST_SPLIT  = 0.10          # %10 test (eğer test klasörü boşsa)
+
+# Loss
+BCE_WEIGHT  = 0.4           # Kombine loss: 0.4 * BCE + 0.6 * Dice
+DICE_WEIGHT = 0.6
+
+# Dengesizlik için pozitif sınıf ağırlığı
+# Veri setinde neredeyse hepsi çürüklü → negatif sınıfı ağırlıklandır
+POS_WEIGHT  = torch.tensor([0.05]).to(DEVICE)  # Ayarlanabilir
+
+# Early stopping
+PATIENCE    = 7             # 7 epoch iyileşme olmazsa dur
+
+# Threshold (binary karar)
+THRESHOLD   = 0.5
+
+# ============================================================
+# AUGMENTATION OLASILIKLARI
+# ============================================================
+AUG_FLIP_PROB     = 0.5
+AUG_ROTATE_PROB   = 0.5
+AUG_ROTATE_RANGE  = 0.2     # radyan (~11 derece)
+AUG_ZOOM_PROB     = 0.3
+AUG_ZOOM_RANGE    = (0.9, 1.1)
+AUG_NOISE_PROB    = 0.2
+AUG_CONTRAST_PROB = 0.3
+
+# ============================================================
+# KONTROL ÇIKTISI
+# ============================================================
+print("=" * 50)
+print(f"  IMG_SIZE    : {IMG_SIZE}")
+print(f"  BATCH_SIZE  : {BATCH_SIZE}")
+print(f"  NUM_EPOCHS  : {NUM_EPOCHS}")
+print(f"  LR          : {LR}")
+print(f"  DEVICE      : {DEVICE}")
+print(f"  CHECKPOINT  : {CHECKPOINT_DIR}")
+print(f"  OUTPUT      : {OUTPUT_DIR}")
+print("=" * 50)
+# ============================================================
+# BÖLÜM 2: DATASET & AUGMENTATION
+# ============================================================
+
+import os
+import numpy as np
+import cv2
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from monai.transforms import (
+    Compose,
+    RandFlipd,
+    RandRotated,
+    RandZoomd,
+    RandGaussianNoised,
+    RandAdjustContrastd,
+)
+
+# ============================================================
+# 2.1 — DOSYA LİSTESİ OLUŞTURMA
+# ============================================================
+
+def get_file_pairs(image_dir, mask_dir):
+    """
+    image_dir ve mask_dir içindeki PNG dosyalarını eşleştirir.
+    Dosya adları birebir aynı olmalı (örn: 0001.png <-> 0001.png)
+    """
+    image_files = sorted([
+        f for f in os.listdir(image_dir) if f.endswith(".png")
+    ])
+    mask_files = sorted([
+        f for f in os.listdir(mask_dir) if f.endswith(".png")
+    ])
+
+    # Sadece her iki klasörde de olan dosyaları al
+    common = sorted(set(image_files) & set(mask_files))
+
+    pairs = [
+        (
+            os.path.join(image_dir, f),
+            os.path.join(mask_dir,  f)
+        )
+        for f in common
+    ]
+
+    print(f"[INFO] Eşleşen dosya sayısı: {len(pairs)}")
+    return pairs
+
+
+# Train/Val split (aynı klasörden bölünüyor)
+all_pairs = get_file_pairs(TRAIN_IMAGE_DIR, TRAIN_MASK_DIR)
+
+train_pairs, val_pairs = train_test_split(
+    all_pairs,
+    test_size=VAL_SPLIT,
+    random_state=SEED,
+    shuffle=True
+)
+
+# Test seti ayrı klasörden
+test_pairs = get_file_pairs(TEST_IMAGE_DIR, TEST_MASK_DIR)
+
+print(f"[INFO] Train : {len(train_pairs)}")
+print(f"[INFO] Val   : {len(val_pairs)}")
+print(f"[INFO] Test  : {len(test_pairs)}")
+
+
+# ============================================================
+# 2.2 — AUGMENTATION PIPELINE
+# ============================================================
+
+def apply_augmentation(image, mask):
+    """
+    NumPy formatında (H, W, C) image ve (H, W, 1) mask alır.
+    MONAI dict-transform formatına çevirip augmentation uygular.
+    """
+
+    # MONAI dict formatı için channel-first'e çevir
+    # image: (C, H, W), mask: (1, H, W)
+    image_t = np.transpose(image, (2, 0, 1)).astype(np.float32)
+    mask_t  = np.transpose(mask,  (2, 0, 1)).astype(np.float32)
+
+    data = {"image": image_t, "mask": mask_t}
+
+    aug = Compose([
+        RandFlipd(
+            keys=["image", "mask"],
+            prob=AUG_FLIP_PROB,
+            spatial_axis=1          # Yatay flip
+        ),
+        RandFlipd(
+            keys=["image", "mask"],
+            prob=AUG_FLIP_PROB * 0.5,
+            spatial_axis=0          # Dikey flip (daha az)
+        ),
+        RandRotated(
+            keys=["image", "mask"],
+            prob=AUG_ROTATE_PROB,
+            range_x=AUG_ROTATE_RANGE,
+            mode=["bilinear", "nearest"],  # Maske nearest neighbor
+            padding_mode="zeros"
+        ),
+        RandZoomd(
+            keys=["image", "mask"],
+            prob=AUG_ZOOM_PROB,
+            min_zoom=AUG_ZOOM_RANGE[0],
+            max_zoom=AUG_ZOOM_RANGE[1],
+            mode=["bilinear", "nearest"]
+        ),
+        RandGaussianNoised(
+            keys=["image"],         # Sadece görüntüye noise
+            prob=AUG_NOISE_PROB,
+            mean=0.0,
+            std=0.05
+        ),
+        RandAdjustContrastd(
+            keys=["image"],         # Sadece görüntüye kontrast
+            prob=AUG_CONTRAST_PROB,
+            gamma=(0.8, 1.2)
+        ),
+    ])
+
+    result = aug(data)
+
+    # Geri (H, W, C) formatına çevir
+    image_out = np.transpose(result["image"], (1, 2, 0))
+    mask_out  = np.transpose(result["mask"],  (1, 2, 0))
+
+    return image_out, mask_out
+
+
+# ============================================================
+# 2.3 — CUSTOM DATASET SINIFI
+# ============================================================
+
+class DentalDataset(Dataset):
+    """
+    Periapical & Panoramik diş röntgeni segmentasyon dataset'i.
+    - image : (3, 512, 512) float32 tensor [0, 1]
+    - mask  : (1, 512, 512) float32 tensor {0, 1}
+    """
+
+    def __init__(self, pairs, augment=False):
+        """
+        Args:
+            pairs   : [(image_path, mask_path), ...] listesi
+            augment : True ise augmentation uygulanır (sadece train)
+        """
+        self.pairs   = pairs
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def _load_image(self, path):
+        """
+        PNG görüntüyü yükler, RGB'ye çevirir, [0,1] normalize eder.
+        Gri görüntüleri 3 kanala kopyalar (EfficientNet için).
+        Çıktı: (H, W, 3) float32
+        """
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+        if img is None:
+            raise FileNotFoundError(f"Görüntü yüklenemedi: {path}")
+
+        # Gri ise 3 kanala çevir
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # [0, 1] normalize
+        img = img.astype(np.float32) / 255.0
+        return img  # (H, W, 3)
+
+    def _load_mask(self, path):
+        """
+        Binary maske yükler.
+        Beyaz (255) = çürük → 1
+        Siyah (0)   = sağlam → 0
+        Çıktı: (H, W, 1) float32
+        """
+        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+        if mask is None:
+            raise FileNotFoundError(f"Maske yüklenemedi: {path}")
+
+        # Binary threshold (ara değer varsa temizle)
+        _, mask = cv2.threshold(mask, 127, 1, cv2.THRESH_BINARY)
+
+        mask = mask.astype(np.float32)
+        mask = np.expand_dims(mask, axis=-1)  # (H, W, 1)
+        return mask
+
+    def __getitem__(self, idx):
+        img_path, mask_path = self.pairs[idx]
+
+        image = self._load_image(img_path)   # (H, W, 3)
+        mask  = self._load_mask(mask_path)   # (H, W, 1)
+
+        # Augmentation (sadece train)
+        if self.augment:
+            image, mask = apply_augmentation(image, mask)
+
+        # Tensor'a çevir: (C, H, W)
+        image = torch.from_numpy(
+            np.transpose(image, (2, 0, 1))
+        ).float()
+
+        mask = torch.from_numpy(
+            np.transpose(mask, (2, 0, 1))
+        ).float()
+
+        # Maske tekrar binary garantisi
+        mask = (mask > 0.5).float()
+
+        return image, mask
+
+
+# ============================================================
+# 2.4 — DATALOADER'LAR
+# ============================================================
+
+train_dataset = DentalDataset(train_pairs, augment=True)
+val_dataset   = DentalDataset(val_pairs,   augment=False)
+test_dataset  = DentalDataset(test_pairs,  augment=False)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,          # Colab için 0
+    pin_memory=False,       # CPU için False
+    drop_last=True          # Son eksik batch'i at
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=False
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=1,           # Test'te tek tek değerlendir
+    shuffle=False,
+    num_workers=0,
+    pin_memory=False
+)
+
+
+# ============================================================
+# 2.5 — DATASET DOĞRULAMA
+# ============================================================
+
+def verify_dataset(loader, name="Dataset"):
+    """Bir batch alıp shape ve değer aralığını kontrol eder."""
+    images, masks = next(iter(loader))
+    print(f"\n[CHECK] {name}")
+    print(f"  Image shape : {images.shape}   "
+          f"min={images.min():.3f} max={images.max():.3f}")
+    print(f"  Mask  shape : {masks.shape}   "
+          f"unique={masks.unique().tolist()}")
+
+verify_dataset(train_loader, "Train Loader")
+verify_dataset(val_loader,   "Val Loader")
+verify_dataset(test_loader,  "Test Loader")
+
+
+# ============================================================
+# 2.6 — ÖRNEK GÖRSELLEŞTİRME (İsteğe bağlı)
+# ============================================================
+
+def visualize_samples(dataset, n=3, title="Örnekler"):
+    """Dataset'ten rastgele n örnek gösterir."""
+    fig, axes = plt.subplots(n, 2, figsize=(8, n * 3))
+    indices = random.sample(range(len(dataset)), n)
+
+    for row, idx in enumerate(indices):
+        image, mask = dataset[idx]
+
+        # (C,H,W) → (H,W,C)
+        img_np  = image.permute(1, 2, 0).numpy()
+        mask_np = mask.squeeze().numpy()
+
+        axes[row, 0].imshow(img_np)
+        axes[row, 0].set_title(f"Görüntü #{idx}")
+        axes[row, 0].axis("off")
+
+        axes[row, 1].imshow(mask_np, cmap="gray")
+        axes[row, 1].set_title(f"Maske #{idx}")
+        axes[row, 1].axis("off")
+
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+# Çalıştırmak isterseniz yorum satırını kaldırın:
+# visualize_samples(train_dataset, n=3, title="Train Örnekleri")
+# ============================================================
+# BÖLÜM 3: MODEL — EfficientNet-B4 + U-Net Decoder
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import efficientnet_b4, EfficientNet_B4_Weights
+
+# ============================================================
+# BÖLÜM 3: MODEL — EfficientNet-B4 + U-Net Decoder (DÜZELTİLMİŞ)
+# ============================================================
+
+# Gerçek EfficientNet-B4 kanal haritası:
+# features[0] → (B,   48, 256, 256)  ← skip s1
+# features[1] → (B,   24, 256, 256)  ← skip s2
+# features[2] → (B,   32, 128, 128)  ← skip s3
+# features[3] → (B,   56,  64,  64)  ← skip s4
+# features[4] → (B,  112,  32,  32)  ← skip s5
+# features[5] → (B,  160,  32,  32)  (aynı spatial, kullanmıyoruz)
+# features[6] → (B,  272,  16,  16)  (aynı spatial, kullanmıyoruz)
+# features[7] → (B,  448,  16,  16)  (aynı spatial, kullanmıyoruz)
+# features[8] → (B, 1792,  16,  16)  ← bottleneck
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import efficientnet_b4, EfficientNet_B4_Weights
+
+# ============================================================
+# BÖLÜM 3: MODEL — EfficientNet-B4 + U-Net Decoder
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import efficientnet_b4, EfficientNet_B4_Weights
+
+# ============================================================
+# 3.1 — YARDIMCI BLOKLAR
+# ============================================================
+
+class ConvBnRelu(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel=3, padding=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel,
+                      padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.Upsample(
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=True
+        )
+        self.conv = nn.Sequential(
+            ConvBnRelu(in_ch + skip_ch, out_ch),
+            ConvBnRelu(out_ch, out_ch)
+        )
+
+    def forward(self, x, skip=None):
+        x = self.up(x)
+        if skip is not None:
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(
+                    x,
+                    size=skip.shape[2:],
+                    mode="bilinear",
+                    align_corners=True
+                )
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_ch, out_ch=256):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3,
+                      padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3,
+                      padding=12, dilation=12, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3,
+                      padding=18, dilation=18, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * 5, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5)
+        )
+
+    def forward(self, x):
+        size = x.shape[2:]
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+        x5 = F.interpolate(
+            self.pool(x), size=size,
+            mode="bilinear", align_corners=True
+        )
+        return self.project(
+            torch.cat([x1, x2, x3, x4, x5], dim=1)
+        )
+
+
+# ============================================================
+# 3.2 — ANA MODEL
+# ============================================================
+
+class DentalSegNet(nn.Module):
+    """
+    EfficientNet-B4 Encoder + ASPP + U-Net Decoder
+
+    Gerçek kanal haritası:
+        features[0] → (B,   48, 256, 256)  s1
+        features[1] → (B,   24, 256, 256)  s2
+        features[2] → (B,   32, 128, 128)  s3
+        features[3] → (B,   56,  64,  64)  s4
+        features[4] → (B,  112,  32,  32)  s5
+        features[8] → (B, 1792,  16,  16)  bottleneck
+    """
+
+    def __init__(self, num_classes=1, pretrained=True):
+        super().__init__()
+
+        weights  = EfficientNet_B4_Weights.DEFAULT \
+                   if pretrained else None
+        backbone = efficientnet_b4(weights=weights)
+        self.encoder = backbone.features
+
+        # İlk 6 bloğu dondur
+        for i, block in enumerate(self.encoder):
+            if i < 6:
+                for param in block.parameters():
+                    param.requires_grad = False
+
+        # ASPP
+        self.aspp = ASPP(in_ch=1792, out_ch=256)
+
+        # Decoder blokları
+        self.dec5 = DecoderBlock(256, 112, 128)  # 16→32
+        self.dec4 = DecoderBlock(128,  56,  64)  # 32→64
+        self.dec3 = DecoderBlock( 64,  32,  32)  # 64→128
+        self.dec2 = DecoderBlock( 32,  24,  16)  # 128→256
+        self.dec1 = DecoderBlock( 16,   0,   8)  # 256→512
+
+        # s1 ayrı upsample (256→512) + kanal indir
+        self.s1_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2,
+                        mode="bilinear", align_corners=True),
+            ConvBnRelu(48, 8)
+        )
+
+        # dec1 + s1_conv concat sonrası conv
+        self.dec0_conv = nn.Sequential(
+            ConvBnRelu(8 + 8, 8),
+            ConvBnRelu(8, 8)
+        )
+
+        # Segmentasyon başlığı
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(8, 8, kernel_size=3,
+                      padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, num_classes, kernel_size=1)
+        )
+
+        self.dropout = nn.Dropout2d(p=0.3)
+
+    def forward(self, x):
+        skips = {}
+
+        for i, block in enumerate(self.encoder):
+            x = block(x)
+            if   i == 0: skips["s1"] = x  # (B, 48,256,256)
+            elif i == 1: skips["s2"] = x  # (B, 24,256,256)
+            elif i == 2: skips["s3"] = x  # (B, 32,128,128)
+            elif i == 3: skips["s4"] = x  # (B, 56, 64, 64)
+            elif i == 4: skips["s5"] = x  # (B,112, 32, 32)
+        # x: (B,1792,16,16)
+
+        # ASPP
+        x = self.aspp(x)                    # (B,256,16,16)
+        x = self.dropout(x)
+
+        # Decoder
+        x = self.dec5(x, skips["s5"])       # (B,128,32,32)
+        x = self.dec4(x, skips["s4"])       # (B, 64,64,64)
+        x = self.dec3(x, skips["s3"])       # (B, 32,128,128)
+        x = self.dec2(x, skips["s2"])       # (B, 16,256,256)
+        x = self.dec1(x, None)              # (B,  8,512,512)
+
+        # s1 skip: 256→512 upsample + concat
+        s1_up = self.s1_conv(skips["s1"])   # (B,  8,512,512)
+        x     = torch.cat([x, s1_up], dim=1)# (B, 16,512,512)
+        x     = self.dec0_conv(x)           # (B,  8,512,512)
+
+        return self.seg_head(x)             # (B,  1,512,512)
+
+
+# ============================================================
+# 3.3 — MODEL BAŞLATMA & ÖZET
+# ============================================================
+model = DentalSegNet(num_classes=1, pretrained=True).to(DEVICE)
+
+total_params     = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters()
+                       if p.requires_grad)
+
+print("=" * 50)
+print(f"  Toplam parametre    : {total_params:,}")
+print(f"  Eğitilebilir param  : {trainable_params:,}")
+print(f"  Dondurulmuş param   : "
+      f"{total_params - trainable_params:,}")
+print("=" * 50)
+
+
+# (BURADAN SONRASI SİLİNDİ, DİREKT BÖLÜM 3.4'E GEÇİN)
+# ============================================================
+# CHECKPOINT YÜKLEME (19/20. EPOCH BAĞLANTISI)
+# ============================================================
+start_epoch = 0
+
+if os.path.exists(LOAD_CHECKPOINT_PATH):
+    print(f"\n[BİLGİ] Önceki eğitim yükleniyor: {LOAD_CHECKPOINT_PATH}")
+    
+    # 1. Dosyayı PyTorch ile belleğe oku
+    checkpoint = torch.load(LOAD_CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
+    
+    # 2. Okunan bu ağırlıkları, yukarıda oluşturduğun DentalSegNet içine yerleştir
+    model.load_state_dict(checkpoint["model_state"])
+    
+    # 3. 20. epoch yüklendiğine göre, bir sonraki döngü 21. adımdan (index 20) başlamalı
+    start_epoch = 20 
+    
+    print(f"[BAŞARILI] Model ağırlıkları yüklendi! Eğitim {start_epoch + 1}. epoch'tan devam edecek.\n")
+else:
+    print("\n[UYARI] Checkpoint bulunamadı. Eğitim SIFIRDAN başlıyor!\n")
+
+
+# ============================================================
+# BUNDAN SONRASI SENİN OPTIMIZER, LOSS VE EĞİTİM DÖNGÜN...
+# ============================================================
+# optimizer = torch.optim.Adam(...)
+# criterion = ...
+#
+# for epoch in range(start_epoch, NUM_EPOCHS):
+#      ...
+
+# ============================================================
+# 3.4 — FORWARD PASS TESTİ
+# ============================================================
+
+def test_forward_pass(model, device, img_size=512):
+    model.eval()
+    dummy = torch.randn(2, 3, img_size, img_size).to(device)
+
+    with torch.no_grad():
+        out = model(dummy)
+
+    print(f"\n[TEST] Forward Pass")
+    print(f"  Giriş  : {dummy.shape}")
+    print(f"  Çıkış  : {out.shape}")
+    print(f"  Çıkış aralığı: [{out.min():.3f}, {out.max():.3f}]")
+    assert out.shape == (2, 1, img_size, img_size), \
+        f"Boyut hatası: {out.shape}"
+    print("  [OK] Forward pass başarılı!\n")
+    model.train()
+
+
+test_forward_pass(model, DEVICE, IMG_SIZE)
+
+
+# ============================================================
+# 3.5 — ENCODER UNFREEZE FONKSİYONU
+# ============================================================
+
+def unfreeze_encoder(model, from_block=4):
+    for i, block in enumerate(model.encoder):
+        if i >= from_block:
+            for param in block.parameters():
+                param.requires_grad = True
+
+    trainable = sum(p.numel() for p in model.parameters()
+                    if p.requires_grad)
+    print(f"[INFO] Encoder {from_block}. bloktan açıldı.")
+    print(f"[INFO] Eğitilebilir parametre: {trainable:,}")
+
+# Bölüm 5'te otomatik çağrılacak:
+# if epoch == 12:
+#     unfreeze_encoder(model, from_block=4)
+# ============================================================
+# BÖLÜM 4: LOSS FONKSİYONLARI & METRİKLER
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from monai.losses import DiceLoss
+import numpy as np
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix
+)
+
+# ============================================================
+# 4.1 — LOSS FONKSİYONLARI
+# ============================================================
+
+class WeightedBCELoss(nn.Module):
+    """
+    Pozitif sınıf ağırlıklı Binary Cross Entropy.
+    Veri setinde sağlam diş (negatif) çok az olduğu için
+    negatif sınıfı ağırlıklandırır.
+    """
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    def forward(self, logits, targets):
+        return self.loss_fn(logits, targets)
+
+
+class DiceBCELoss(nn.Module):
+    """
+    Kombine Loss: alpha * BCE + beta * Dice
+    - BCE  → piksel bazlı doğruluk
+    - Dice → bölge örtüşmesi (segmentasyon kalitesi)
+    Precision/Recall dengesi için ikisi birlikte kullanılır.
+    """
+    def __init__(self,
+                 pos_weight=None,
+                 alpha=BCE_WEIGHT,
+                 beta=DICE_WEIGHT):
+        super().__init__()
+        self.alpha    = alpha
+        self.beta     = beta
+        self.bce_loss = WeightedBCELoss(pos_weight=pos_weight)
+        self.dice_loss = DiceLoss(
+            sigmoid=True,       # Logit alır, sigmoid içeride
+            squared_pred=True,  # Kararlı gradyan için
+            reduction="mean"
+        )
+
+    def forward(self, logits, targets):
+        bce  = self.bce_loss(logits, targets)
+        dice = self.dice_loss(logits, targets)
+        combined = self.alpha * bce + self.beta * dice
+        return combined, bce, dice
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss: Zor örneklere odaklanır.
+    Çok küçük çürük bölgelerinde BCE'ye alternatif.
+    DiceBCELoss ile swap edilebilir.
+    """
+    def __init__(self, alpha=0.8, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        bce   = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+        probs = torch.sigmoid(logits)
+        pt    = targets * probs + (1 - targets) * (1 - probs)
+        focal = self.alpha * (1 - pt) ** self.gamma * bce
+        return focal.mean()
+
+
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss: alpha/beta ile FP/FN ağırlığı ayarlanır.
+    Recall odaklı eğitim için (FN cezası yüksek tutulur).
+    alpha=0.3, beta=0.7 → recall'u maximize eder.
+    """
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-6):
+        super().__init__()
+        self.alpha  = alpha
+        self.beta   = beta
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        probs = probs.view(-1)
+        targets = targets.view(-1)
+
+        tp = (probs * targets).sum()
+        fp = ((1 - targets) * probs).sum()
+        fn = (targets * (1 - probs)).sum()
+
+        tversky = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        return 1 - tversky
+
+
+# ============================================================
+# 4.2 — ANA LOSS SEÇİMİ
+# ============================================================
+
+# Proje için ana loss: DiceBCE
+criterion = DiceBCELoss(
+    pos_weight=POS_WEIGHT,   # Bölüm 1'de tanımlandı
+    alpha=BCE_WEIGHT,         # 0.4
+    beta=DICE_WEIGHT          # 0.6
+)
+
+# Alternatif losslar (gerekirse swap edin):
+# criterion = TverskyLoss(alpha=0.3, beta=0.7)
+# criterion = FocalLoss(alpha=0.8, gamma=2.0)
+
+print(f"[INFO] Loss: DiceBCE "
+      f"(BCE={BCE_WEIGHT}, Dice={DICE_WEIGHT})")
+
+
+# ============================================================
+# 4.3 — METRİK HESAPLAMA
+# ============================================================
+
+class SegmentationMetrics:
+    """
+    Binary segmentasyon metrikleri:
+    Precision, Recall, F1, IoU (Jaccard), Dice
+    Batch bazlı veya epoch bazlı hesaplanır.
+    """
+
+    def __init__(self, threshold=THRESHOLD, eps=1e-6):
+        self.threshold = threshold
+        self.eps       = eps
+        self.reset()
+
+    def reset(self):
+        """Epoch başında çağrılır."""
+        self.tp = 0.0
+        self.fp = 0.0
+        self.fn = 0.0
+        self.tn = 0.0
+
+    def update(self, logits, targets):
+        """
+        Her batch sonunda çağrılır.
+        logits  : (B, 1, H, W) ham çıktı
+        targets : (B, 1, H, W) binary maske {0, 1}
+        """
+        probs = torch.sigmoid(logits)
+        preds = (probs > self.threshold).float()
+
+        preds_np   = preds.detach().cpu().numpy().flatten()
+        targets_np = targets.detach().cpu().numpy().flatten()
+
+        self.tp += ((preds_np == 1) & (targets_np == 1)).sum()
+        self.fp += ((preds_np == 1) & (targets_np == 0)).sum()
+        self.fn += ((preds_np == 0) & (targets_np == 1)).sum()
+        self.tn += ((preds_np == 0) & (targets_np == 0)).sum()
+
+    def compute(self):
+        """Epoch sonunda tüm metrikleri döndürür."""
+        eps = self.eps
+
+        precision = self.tp / (self.tp + self.fp + eps)
+        recall    = self.tp / (self.tp + self.fn + eps)
+        f1        = (2 * precision * recall /
+                     (precision + recall + eps))
+        iou       = self.tp / (self.tp + self.fp + self.fn + eps)
+        dice      = (2 * self.tp /
+                     (2 * self.tp + self.fp + self.fn + eps))
+        specificity = self.tn / (self.tn + self.fp + eps)
+
+        return {
+            "precision"  : float(precision),
+            "recall"     : float(recall),
+            "f1"         : float(f1),
+            "iou"        : float(iou),
+            "dice"       : float(dice),
+            "specificity": float(specificity)
+        }
+
+    def print_metrics(self, phase="Train", loss=None):
+        """Metrikleri formatlı yazdırır."""
+        m = self.compute()
+        loss_str = f"Loss={loss:.4f} | " if loss else ""
+        print(
+            f"[{phase}] {loss_str}"
+            f"Precision={m['precision']:.4f} | "
+            f"Recall={m['recall']:.4f} | "
+            f"F1={m['f1']:.4f} | "
+            f"IoU={m['iou']:.4f} | "
+            f"Dice={m['dice']:.4f}"
+        )
+        return m
+
+
+# ============================================================
+# 4.4 — OPTİMAL THRESHOLD BULMA
+# ============================================================
+
+def find_optimal_threshold(model, loader, device,
+                           thresholds=None):
+    """
+    Validation seti üzerinde F1'i maksimize eden
+    threshold değerini bulur.
+    Eğitim bittikten sonra bir kez çağrılır.
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.1, 0.9, 0.05)
+
+    model.eval()
+    all_probs   = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            logits = model(images)
+            probs  = torch.sigmoid(logits)
+            all_probs.append(probs.cpu().numpy().flatten())
+            all_targets.append(masks.numpy().flatten())
+
+    all_probs   = np.concatenate(all_probs)
+    all_targets = np.concatenate(all_targets).astype(int)
+
+    best_f1, best_thr = 0.0, 0.5
+    print("\n[INFO] Threshold Arama:")
+
+    for thr in thresholds:
+        preds = (all_probs > thr).astype(int)
+        f1    = f1_score(all_targets, preds,
+                         zero_division=0)
+        prec  = precision_score(all_targets, preds,
+                                zero_division=0)
+        rec   = recall_score(all_targets, preds,
+                             zero_division=0)
+        print(f"  thr={thr:.2f} → "
+              f"F1={f1:.4f} | "
+              f"Prec={prec:.4f} | "
+              f"Rec={rec:.4f}")
+
+        if f1 > best_f1:
+            best_f1  = f1
+            best_thr = thr
+
+    print(f"\n[BEST] Threshold={best_thr:.2f} | F1={best_f1:.4f}")
+    return best_thr
+
+
+# ============================================================
+# 4.5 — LOSS & METRİK TESTİ
+# ============================================================
+
+def test_loss_and_metrics():
+    """Loss ve metrik hesaplamayı rastgele tensorla test eder."""
+    print("\n[TEST] Loss & Metrik Doğrulama")
+
+    B, C, H, W = 2, 1, 512, 512
+    dummy_logits  = torch.randn(B, C, H, W).to(DEVICE)
+    dummy_targets = torch.randint(0, 2, (B, C, H, W)
+                                  ).float().to(DEVICE)
+
+    # Loss testi
+    combined, bce, dice = criterion(dummy_logits, dummy_targets)
+    print(f"  Combined Loss : {combined.item():.4f}")
+    print(f"  BCE Loss      : {bce.item():.4f}")
+    print(f"  Dice Loss     : {dice.item():.4f}")
+
+    # Metrik testi
+    metrics = SegmentationMetrics(threshold=THRESHOLD)
+    metrics.update(dummy_logits, dummy_targets)
+    metrics.print_metrics(phase="Test")
+
+    print("  [OK] Loss & Metrik testi başarılı!\n")
+
+test_loss_and_metrics()
+# ============================================================
+# BÖLÜM 5: TRAINING LOOP
+# ============================================================
+
+import os
+import time
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# ============================================================
+# 5.1 — OPTİMİZER & SCHEDULER
+# ============================================================
+
+optimizer = torch.optim.AdamW([
+    {
+        "params": model.encoder.parameters(),
+        "lr"    : LR * 0.1,
+        "weight_decay": WEIGHT_DECAY
+    },
+    {
+        "params": (
+            list(model.aspp.parameters())     +
+            list(model.dec5.parameters())     +
+            list(model.dec4.parameters())     +
+            list(model.dec3.parameters())     +
+            list(model.dec2.parameters())     +
+            list(model.dec1.parameters())     +
+            list(model.s1_conv.parameters())  +
+            list(model.dec0_conv.parameters())+
+            list(model.seg_head.parameters())
+        ),
+        "lr"    : LR,
+        "weight_decay": WEIGHT_DECAY
+    }
+], lr=LR)
+
+scheduler = CosineAnnealingLR(
+    optimizer,
+    T_max=NUM_EPOCHS,
+    eta_min=LR_MIN
+)
+
+print(f"[INFO] Optimizer : AdamW")
+print(f"[INFO] Scheduler : CosineAnnealingLR "
+      f"(T_max={NUM_EPOCHS}, eta_min={LR_MIN})")
+
+# ============================================================
+# 5.2 — CHECKPOINT FONKSİYONLARI
+# ============================================================
+
+def save_checkpoint(model, optimizer, scheduler,
+                    epoch, metrics, path):
+    """En iyi modeli kaydeder."""
+    torch.save({
+        "epoch"         : epoch,
+        "model_state"   : model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "metrics"       : metrics,
+    }, path)
+    print(f"  [SAVED] Checkpoint → {path}")
+
+
+def load_checkpoint(model, optimizer, scheduler, path):
+    """Kaydedilmiş checkpoint'i yükler."""
+    if not os.path.exists(path):
+        print(f"[WARN] Checkpoint bulunamadı: {path}")
+        return 0, {}
+
+    ckpt = torch.load(path, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    scheduler.load_state_dict(ckpt["scheduler_state"])
+
+    print(f"[INFO] Checkpoint yüklendi → Epoch {ckpt['epoch']}")
+    return ckpt["epoch"], ckpt["metrics"]
+
+
+# ============================================================
+# 5.3 — EARLY STOPPING
+# ============================================================
+
+class EarlyStopping:
+    """
+    Validation F1 skoru iyileşmezse eğitimi durdurur.
+    Precision/Recall odaklı projede F1 takip edilir.
+    """
+
+    def __init__(self, patience=PATIENCE, min_delta=1e-4):
+        self.patience   = patience
+        self.min_delta  = min_delta
+        self.counter    = 0
+        self.best_score = None
+        self.stop       = False
+
+    def __call__(self, val_f1):
+        if self.best_score is None:
+            self.best_score = val_f1
+
+        elif val_f1 < self.best_score + self.min_delta:
+            self.counter += 1
+            print(f"  [EarlyStopping] Sayaç: "
+                  f"{self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                print("  [EarlyStopping] Eğitim durduruluyor!")
+                self.stop = True
+        else:
+            self.best_score = val_f1
+            self.counter    = 0
+
+
+# ============================================================
+# 5.4 — TEK EPOCH: TRAIN
+# ============================================================
+
+def train_one_epoch(model, loader, optimizer,
+                    criterion, device, epoch):
+    """
+    Bir epoch boyunca tüm train batch'lerini işler.
+    Döndürür: ortalama loss, metrik dict
+    """
+    model.train()
+    metrics    = SegmentationMetrics(threshold=THRESHOLD)
+    total_loss = 0.0
+    n_batches  = len(loader)
+
+    for batch_idx, (images, masks) in enumerate(loader):
+        images = images.to(device)
+        masks  = masks.to(device)
+
+        # Forward
+        optimizer.zero_grad()
+        logits = model(images)
+
+        # Loss
+        combined, bce, dice = criterion(logits, masks)
+
+        # Backward
+        combined.backward()
+
+        # Gradient clipping (CPU'da kararlılık için)
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=1.0
+        )
+
+        optimizer.step()
+
+        # Metrik güncelle
+        total_loss += combined.item()
+        metrics.update(logits.detach(), masks.detach())
+
+        # İlerleme (her 50 batch'te bir)
+        if (batch_idx + 1) % 50 == 0:
+            print(f"    Batch [{batch_idx+1}/{n_batches}] "
+                  f"Loss={combined.item():.4f} "
+                  f"BCE={bce.item():.4f} "
+                  f"Dice={dice.item():.4f}")
+
+    avg_loss = total_loss / n_batches
+    return avg_loss, metrics.compute()
+
+
+# ============================================================
+# 5.5 — TEK EPOCH: VALIDATION
+# ============================================================
+
+def validate_one_epoch(model, loader, criterion, device):
+    """
+    Validation epoch'u çalıştırır.
+    Döndürür: ortalama loss, metrik dict
+    """
+    model.eval()
+    metrics    = SegmentationMetrics(threshold=THRESHOLD)
+    total_loss = 0.0
+    n_batches  = len(loader)
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            masks  = masks.to(device)
+
+            logits           = model(images)
+            combined, _, _   = criterion(logits, masks)
+
+            total_loss += combined.item()
+            metrics.update(logits, masks)
+
+    avg_loss = total_loss / n_batches
+    return avg_loss, metrics.compute()
+
+
+# ============================================================
+# 5.6 — GEÇMİŞ KAYIT YAPISI
+# ============================================================
+
+history = {
+    "train_loss" : [],
+    "val_loss"   : [],
+    "train_f1"   : [],
+    "val_f1"     : [],
+    "train_prec" : [],
+    "val_prec"   : [],
+    "train_rec"  : [],
+    "val_rec"    : [],
+    "train_iou"  : [],
+    "val_iou"    : [],
+    "lr"         : [],
+}
+
+
+
+
+# ============================================================
+# 5.7 — ANA EĞİTİM DÖNGÜSÜ (Kaldığı Yerden Devam Etme Özellikli)
+# ============================================================
+
+def train(model, train_loader, val_loader,
+          optimizer, scheduler, criterion,
+          device, num_epochs, start_epoch=1):
+
+    early_stopping = EarlyStopping(patience=PATIENCE)
+    best_val_f1    = 0.0
+    best_ckpt_path = os.path.join(
+        CHECKPOINT_DIR, "best_model.pth"
+    )
+
+    print("\n" + "=" * 60)
+    print("  EĞİTİM BAŞLIYOR / DEVAM EDİYOR")
+    print(f"  Hedef Epoch: {num_epochs} | Başlangıç Epoch: {start_epoch} | "
+          f"Batch: {BATCH_SIZE} | "
+          f"Device: {device}")
+    print("=" * 60 + "\n")
+
+    for epoch in range(start_epoch, num_epochs + 1):
+        epoch_start = time.time()
+
+        # ── Encoder Unfreeze (Epoch 12) ──────────────────────
+        if epoch == 12:
+            unfreeze_encoder(model, from_block=4)
+            # Decoder LR'yi koru, encoder LR'yi güncelle
+            optimizer.param_groups[0]["lr"] = LR * 0.05
+
+        # ── Train ────────────────────────────────────────────
+        train_loss, train_m = train_one_epoch(
+            model, train_loader, optimizer,
+            criterion, device, epoch
+        )
+
+        # ── Validation ───────────────────────────────────────
+        val_loss, val_m = validate_one_epoch(
+            model, val_loader, criterion, device
+        )
+
+        # ── Scheduler ────────────────────────────────────────
+        scheduler.step()
+        current_lr = optimizer.param_groups[1]["lr"]
+
+        # ── History ──────────────────────────────────────────
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_f1"].append(train_m["f1"])
+        history["val_f1"].append(val_m["f1"])
+        history["train_prec"].append(train_m["precision"])
+        history["val_prec"].append(val_m["precision"])
+        history["train_rec"].append(train_m["recall"])
+        history["val_rec"].append(val_m["recall"])
+        history["train_iou"].append(train_m["iou"])
+        history["val_iou"].append(val_m["iou"])
+        history["lr"].append(current_lr)
+
+        # ── Epoch Özeti ──────────────────────────────────────
+        elapsed = time.time() - epoch_start
+        print(f"\nEpoch [{epoch:02d}/{num_epochs}] "
+              f"({elapsed:.1f}s) LR={current_lr:.2e}")
+        print(f"  TRAIN → Loss={train_loss:.4f} | "
+              f"F1={train_m['f1']:.4f} | "
+              f"Prec={train_m['precision']:.4f} | "
+              f"Rec={train_m['recall']:.4f} | "
+              f"IoU={train_m['iou']:.4f}")
+        print(f"  VAL   → Loss={val_loss:.4f}   | "
+              f"F1={val_m['f1']:.4f} | "
+              f"Prec={val_m['precision']:.4f} | "
+              f"Rec={val_m['recall']:.4f} | "
+              f"IoU={val_m['iou']:.4f}")
+
+        # ── En İyi Model Kaydı ───────────────────────────────
+        if val_m["f1"] > best_val_f1:
+            best_val_f1 = val_m["f1"]
+            save_checkpoint(
+                model, optimizer, scheduler,
+                epoch, val_m, best_ckpt_path
+            )
+
+        # ── Her 5 Epoch'ta Ara Kayıt ─────────────────────────
+        if epoch % 5 == 0:
+            periodic_path = os.path.join(
+                CHECKPOINT_DIR, f"epoch_{epoch:02d}.pth"
+            )
+            save_checkpoint(
+                model, optimizer, scheduler,
+                epoch, val_m, periodic_path
+            )
+
+        # ── Early Stopping ───────────────────────────────────
+        early_stopping(val_m["f1"])
+        if early_stopping.stop:
+            print(f"\n[INFO] Early stopping → Epoch {epoch}")
+            break
+
+        print("-" * 60)
+
+    print(f"\n[DONE] En iyi Val F1: {best_val_f1:.4f}")
+    print(f"[DONE] Checkpoint: {best_ckpt_path}")
+    return history
+
+# ============================================================
+# 5.8 — EĞİTİM GRAFİKLERİ
+# ============================================================
+
+def plot_training_history(history):
+    """Loss, F1, Precision, Recall, IoU grafiklerini çizer."""
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("Eğitim Geçmişi", fontsize=16)
+
+    # Loss
+    axes[0, 0].plot(epochs, history["train_loss"],
+                    label="Train", color="steelblue")
+    axes[0, 0].plot(epochs, history["val_loss"],
+                    label="Val", color="tomato")
+    axes[0, 0].set_title("Loss")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+
+    # F1
+    axes[0, 1].plot(epochs, history["train_f1"],
+                    label="Train", color="steelblue")
+    axes[0, 1].plot(epochs, history["val_f1"],
+                    label="Val", color="tomato")
+    axes[0, 1].set_title("F1 Score")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    # Precision
+    axes[0, 2].plot(epochs, history["train_prec"],
+                    label="Train", color="steelblue")
+    axes[0, 2].plot(epochs, history["val_prec"],
+                    label="Val", color="tomato")
+    axes[0, 2].set_title("Precision")
+    axes[0, 2].legend()
+    axes[0, 2].grid(True)
+
+    # Recall
+    axes[1, 0].plot(epochs, history["train_rec"],
+                    label="Train", color="steelblue")
+    axes[1, 0].plot(epochs, history["val_rec"],
+                    label="Val", color="tomato")
+    axes[1, 0].set_title("Recall")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+
+    # IoU
+    axes[1, 1].plot(epochs, history["train_iou"],
+                    label="Train", color="steelblue")
+    axes[1, 1].plot(epochs, history["val_iou"],
+                    label="Val", color="tomato")
+    axes[1, 1].set_title("IoU")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+    # Learning Rate
+    axes[1, 2].plot(epochs, history["lr"],
+                    color="purple")
+    axes[1, 2].set_title("Learning Rate")
+    axes[1, 2].set_yscale("log")
+    axes[1, 2].grid(True)
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, "training_history.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[INFO] Grafik kaydedildi → {save_path}")
+
+
+# ============================================================
+# 5.9 — EĞİTİMİ KALDIĞI YERDEN BAŞLAT (DÜZELTİLMİŞ)
+# ============================================================
+
+start_epoch = 1
+
+# ÖNCELİK 1: Kaggle'dan dışarıdan verdiğimiz dosya var mı? (Örn: epoch_20.pth)
+if 'LOAD_CHECKPOINT_PATH' in locals() and os.path.exists(LOAD_CHECKPOINT_PATH):
+    print(f"\n[INFO] Dışarıdan verilen checkpoint bulundu: {LOAD_CHECKPOINT_PATH}")
+    saved_epoch, saved_metrics = load_checkpoint(
+        model, optimizer, scheduler, LOAD_CHECKPOINT_PATH
+    )
+    start_epoch = saved_epoch + 1
+
+# ÖNCELİK 2: Eğer bu oturumda eğitip durdurduysanız (best_model)
+elif os.path.exists(os.path.join(CHECKPOINT_DIR, "best_model.pth")):
+    RESUME_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+    print(f"\n[INFO] Bu oturuma ait best_model bulundu: {RESUME_PATH}")
+    saved_epoch, saved_metrics = load_checkpoint(
+        model, optimizer, scheduler, RESUME_PATH
+    )
+    start_epoch = saved_epoch + 1
+
+else:
+    print("\n[INFO] Hiçbir kayıt bulunamadı, eğitim SIFIRDAN başlıyor...")
+
+# Eğitimi başlat
+history = train(
+    model       = model,
+    train_loader= train_loader,
+    val_loader  = val_loader,
+    optimizer   = optimizer,
+    scheduler   = scheduler,
+    criterion   = criterion,
+    device      = DEVICE,
+    num_epochs  = NUM_EPOCHS,
+    start_epoch = start_epoch
+)
+
+# Grafikleri çiz
+plot_training_history(history)
+# ============================================================
+# BÖLÜM 6: EVALUATİON & VİSUALİZATİON
+# ============================================================
+
+import os
+import cv2
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap
+from sklearn.metrics import (
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    classification_report
+)
+
+# ============================================================
+# 6.1 — EN İYİ MODELİ YÜKLE
+# ============================================================
+
+def load_best_model(model, checkpoint_dir):
+    """Eğitimde kaydedilen en iyi checkpoint'i yükler."""
+    best_path = os.path.join(checkpoint_dir, "best_model.pth")
+
+    if not os.path.exists(best_path):
+        print(f"[WARN] best_model.pth bulunamadı: {best_path}")
+        return model
+
+    ckpt = torch.load(best_path, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+
+    print(f"[INFO] En iyi model yüklendi.")
+    print(f"  Epoch   : {ckpt['epoch']}")
+    print(f"  Metrics : {ckpt['metrics']}")
+    return model
+
+model = load_best_model(model, CHECKPOINT_DIR)
+
+
+# ============================================================
+# 6.2 — TEST SETİ DEĞERLENDİRME
+# ============================================================
+
+def evaluate_test_set_to_csv(model, loader, criterion, device, threshold=THRESHOLD):
+    model.eval()
+    import csv
+    
+    # Rapor dosyasını hazırla
+    with open("ML_Performans_Raporu.csv", mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Dosya", "IoU", "Dice", "Precision", "Recall", "F1"])
+        
+        with torch.no_grad():
+            for i, (images, masks) in enumerate(loader):
+                images = images.to(device)
+                masks = masks.to(device)
+                logits = model(images)
+                
+                # Metrikleri her görüntü için hesapla (Squeeze ile boyutları düzelt)
+                prob = torch.sigmoid(logits)
+                pred = (prob > threshold).float()
+                
+                # Hibrit koddaki TP, FP, FN mantığı
+                tp = (pred * masks).sum().item()
+                fp = (pred * (1 - masks)).sum().item()
+                fn = ((1 - pred) * masks).sum().item()
+                
+                iou = tp / (tp + fp + fn + 1e-6)
+                dice = 2 * tp / (2 * tp + fp + fn + 1e-6)
+                precision = tp / (tp + fp + 1e-6)
+                recall = tp / (tp + fn + 1e-6)
+                f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
+                
+                writer.writerow([f"Test_{i}", round(iou,4), round(dice,4), 
+                                 round(precision,4), round(recall,4), round(f1,4)])
+    
+    print("[INFO] ML Test Raporu 'ML_Performans_Raporu.csv' olarak kaydedildi.")
+
+
+# ============================================================
+# 6.3 — OPTİMAL THRESHOLD (Test Öncesi Val ile Bul)
+# ============================================================
+
+best_threshold = find_optimal_threshold(
+    model, val_loader, DEVICE
+)
+
+# Bulunan threshold ile test setini yeniden değerlendir
+print(f"\n[INFO] Optimal threshold ({best_threshold:.2f}) "
+      f"ile yeniden değerlendirme:")
+evaluate_test_set(
+    model, test_loader, criterion,
+    DEVICE, threshold=best_threshold
+)
+
+
+# ============================================================
+# 6.4 — CONFUSION MATRIX
+# ============================================================
+
+def plot_confusion_matrix(probs, targets,
+                           threshold=THRESHOLD):
+    """Piksel bazlı confusion matrix çizer."""
+
+    preds_flat   = (probs > threshold).long().numpy().flatten()
+    targets_flat = targets.long().numpy().flatten()
+
+    cm = confusion_matrix(targets_flat, preds_flat)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=["Sağlam (0)", "Çürük (1)"]
+    )
+    disp.plot(ax=ax, colorbar=False, cmap="Blues")
+    ax.set_title("Piksel Bazlı Confusion Matrix", fontsize=13)
+
+    save_path = os.path.join(OUTPUT_DIR, "confusion_matrix.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[INFO] Confusion Matrix → {save_path}")
+
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(
+        targets_flat, preds_flat,
+        target_names=["Sağlam", "Çürük"],
+        zero_division=0
+    ))
+
+plot_confusion_matrix(test_probs, test_targets, best_threshold)
+
+
+# ============================================================
+# 6.5 — TEK GÖRÜNTÜ VİSUALİZASYON
+# ============================================================
+
+def visualize_prediction(image_tensor, mask_tensor,
+                          pred_prob_tensor,
+                          threshold=THRESHOLD,
+                          title="Tahmin",
+                          save_path=None):
+    """
+    Tek bir görüntü için 4 panelli görsel üretir:
+    1) Orijinal röntgen
+    2) Gerçek maske
+    3) Tahmin maskesi
+    4) Overlay (çürük bölge renkli)
+    """
+
+    # Tensor → NumPy
+    img  = image_tensor.permute(1, 2, 0).numpy()
+    img  = np.clip(img, 0, 1)
+
+    gt   = mask_tensor.squeeze().numpy()
+    prob = pred_prob_tensor.squeeze().numpy()
+    pred = (prob > threshold).astype(np.uint8)
+
+    # Overlay oluştur
+    overlay = img.copy()
+    # Çürük tahmin → kırmızı
+    overlay[pred == 1] = overlay[pred == 1] * 0.4 + \
+                         np.array([1.0, 0.0, 0.0]) * 0.6
+    # Gerçek maske sınırı → yeşil kontur
+    gt_uint8   = (gt * 255).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        gt_uint8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    overlay_bgr = (overlay * 255).astype(np.uint8)
+    cv2.drawContours(overlay_bgr, contours, -1,
+                     (0, 255, 0), 2)
+    overlay = overlay_bgr / 255.0
+
+    # Çizim
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle(title, fontsize=14)
+
+    axes[0].imshow(img, cmap="gray")
+    axes[0].set_title("Orijinal Röntgen")
+    axes[0].axis("off")
+
+    axes[1].imshow(gt, cmap="gray", vmin=0, vmax=1)
+    axes[1].set_title("Gerçek Maske")
+    axes[1].axis("off")
+
+    axes[2].imshow(prob, cmap="hot", vmin=0, vmax=1)
+    axes[2].set_title("Tahmin Olasılığı")
+    axes[2].axis("off")
+    plt.colorbar(
+        plt.cm.ScalarMappable(cmap="hot"),
+        ax=axes[2], fraction=0.046
+    )
+
+    axes[3].imshow(overlay)
+    axes[3].set_title("Overlay\n(Kırmızı=Çürük, Yeşil=GT Sınır)")
+    axes[3].axis("off")
+
+    # Lejant
+    red_patch   = mpatches.Patch(
+        color="red",   label="Tahmin Çürük"
+    )
+    green_patch = mpatches.Patch(
+        color="green", label="GT Sınırı"
+    )
+    fig.legend(
+        handles=[red_patch, green_patch],
+        loc="lower center", ncol=2,
+        bbox_to_anchor=(0.75, -0.02)
+    )
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"[INFO] Görsel kaydedildi → {save_path}")
+
+    plt.show()
+    plt.close()
+
+
+# ============================================================
+# 6.6 — TOPLU VİSUALİZASYON
+# ============================================================
+
+def visualize_batch_results(images, targets, probs,
+                              threshold=THRESHOLD,
+                              n=6, output_dir=OUTPUT_DIR):
+    """
+    Test setinden n örnek için görsel üretir ve kaydeder.
+    İyi tahmin, kötü tahmin, sınır vakalar karışık seçilir.
+    """
+
+    n = min(n, len(images))
+
+    # Dice skoru hesapla, düşük/orta/yüksek karışık seç
+    dice_scores = []
+    for i in range(len(images)):
+        p = (probs[i] > threshold).float()
+        t = targets[i]
+        inter  = (p * t).sum()
+        union  = p.sum() + t.sum()
+        dice   = (2 * inter / (union + 1e-6)).item()
+        dice_scores.append((dice, i))
+
+    dice_scores.sort(key=lambda x: x[0])
+
+    # En düşük, orta, en yüksek Dice'lı örnekler
+    indices = []
+    step    = max(1, len(dice_scores) // n)
+    for k in range(0, len(dice_scores), step):
+        indices.append(dice_scores[k][1])
+        if len(indices) >= n:
+            break
+
+    for rank, idx in enumerate(indices):
+        dice_val = dice_scores[
+            [d[1] for d in dice_scores].index(idx)
+        ][0]
+        save_path = os.path.join(
+            output_dir,
+            f"result_{rank+1:02d}_dice{dice_val:.3f}.png"
+        )
+        visualize_prediction(
+            image_tensor     = images[idx],
+            mask_tensor      = targets[idx],
+            pred_prob_tensor = probs[idx],
+            threshold        = threshold,
+            title=f"Örnek #{idx} | Dice={dice_val:.4f}",
+            save_path        = save_path
+        )
+
+print("\n[INFO] Test görselleri üretiliyor...")
+visualize_batch_results(
+    test_images, test_targets, test_probs,
+    threshold=best_threshold, n=6
+)
+
+
+# ============================================================
+# 6.7 — BAŞARISIZ VAKALAR ANALİZİ
+# ============================================================
+
+def analyze_failures(images, targets, probs,
+                      threshold=THRESHOLD, n=4):
+    """
+    En yüksek False Positive ve False Negative vakalarını
+    bulup görselleştirir.
+    """
+
+    fp_scores = []   # Model çürük dedi ama sağlam
+    fn_scores = []   # Model sağlam dedi ama çürük
+
+    for i in range(len(images)):
+        p = (probs[i] > threshold).float().squeeze()
+        t = targets[i].float().squeeze()
+
+        fp = ((p == 1) & (t == 0)).float().sum().item()
+        fn = ((p == 0) & (t == 1)).float().sum().item()
+
+        fp_scores.append((fp, i))
+        fn_scores.append((fn, i))
+
+    fp_scores.sort(reverse=True)
+    fn_scores.sort(reverse=True)
+
+    print(f"\n[ANALİZ] En Yüksek False Positive Vakalar:")
+    for fp_val, idx in fp_scores[:n]:
+        print(f"  Örnek #{idx} → FP Piksel: {int(fp_val)}")
+        visualize_prediction(
+            images[idx], targets[idx], probs[idx],
+            threshold=threshold,
+            title=f"FALSE POSİTİF | Örnek #{idx} | "
+                  f"FP={int(fp_val)} piksel",
+            save_path=os.path.join(
+                OUTPUT_DIR, f"fp_case_{idx}.png"
+            )
+        )
+
+    print(f"\n[ANALİZ] En Yüksek False Negative Vakalar:")
+    for fn_val, idx in fn_scores[:n]:
+        print(f"  Örnek #{idx} → FN Piksel: {int(fn_val)}")
+        visualize_prediction(
+            images[idx], targets[idx], probs[idx],
+            threshold=threshold,
+            title=f"FALSE NEGATİF | Örnek #{idx} | "
+                  f"FN={int(fn_val)} piksel",
+            save_path=os.path.join(
+                OUTPUT_DIR, f"fn_case_{idx}.png"
+            )
+        )
+
+analyze_failures(
+    test_images, test_targets, test_probs,
+    threshold=best_threshold, n=4
+)
+
+
+# ============================================================
+# 6.8 — SONUÇ RAPORU KAYDET
+# ============================================================
+
+def save_report(metrics, threshold, output_dir):
+    """Metrikleri txt olarak kaydeder."""
+    path = os.path.join(output_dir, "test_report.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("=" * 50 + "\n")
+        f.write("  DİŞ ÇÜRÜĞÜ TESPİT - TEST RAPORU\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Threshold   : {threshold:.2f}\n\n")
+        for k, v in metrics.items():
+            f.write(f"{k:<14}: {v:.4f}\n")
+        f.write("\n" + "=" * 50 + "\n")
+
+    print(f"[INFO] Rapor kaydedildi → {path}")
+
+save_report(test_metrics, best_threshold, OUTPUT_DIR)
+# ============================================================
+# BÖLÜM 7: INFERENCE — Tek Görüntüde Çürük Tespiti
+# ============================================================
+
+import os
+import cv2
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image
+import time
+
+# ============================================================
+# 7.1 — INFERENCE SINIFI
+# ============================================================
+
+class DentalInference:
+    """
+    Eğitilmiş modeli kullanarak tek bir röntgen görüntüsünde
+    diş çürüğü tespiti ve segmentasyonu yapar.
+
+    Kullanım:
+        inferencer = DentalInference(
+            model_path="checkpoints/best_model.pth"
+        )
+        result = inferencer.predict("hasta_001.png")
+        inferencer.visualize(result)
+    """
+
+    def __init__(self,
+                 model_path,
+                 threshold=THRESHOLD,
+                 device=DEVICE,
+                 img_size=IMG_SIZE):
+
+        self.threshold = threshold
+        self.device    = device
+        self.img_size  = img_size
+
+        # Modeli yükle
+        self.model = DentalSegNet(
+            num_classes=1,
+            pretrained=False        # Inference'ta False
+        ).to(device)
+
+        self._load_weights(model_path)
+        self.model.eval()
+        print(f"[INFO] Model hazır → {model_path}")
+        print(f"[INFO] Threshold   → {threshold}")
+        print(f"[INFO] Device      → {device}")
+
+    def _load_weights(self, model_path):
+        """Checkpoint'ten ağırlıkları yükler."""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Model bulunamadı: {model_path}"
+            )
+        ckpt = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        epoch = ckpt.get("epoch", "?")
+        print(f"[INFO] Checkpoint yüklendi (Epoch {epoch})")
+
+    def _preprocess(self, image_path):
+        """
+        Görüntüyü yükler ve modele hazırlar.
+        Giriş : PNG dosya yolu
+        Çıkış : (1, 3, H, W) float32 tensor
+        """
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+
+        if img is None:
+            raise FileNotFoundError(
+                f"Görüntü yüklenemedi: {image_path}"
+            )
+
+        # Kanal standardizasyonu
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Boyut kontrolü
+        if img.shape[:2] != (self.img_size, self.img_size):
+            img = cv2.resize(
+                img,
+                (self.img_size, self.img_size),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+        # Normalize + Tensor
+        img_norm = img.astype(np.float32) / 255.0
+        tensor   = torch.from_numpy(
+            np.transpose(img_norm, (2, 0, 1))
+        ).unsqueeze(0).to(self.device)   # (1, 3, H, W)
+
+        return img, img_norm, tensor
+
+    def _postprocess(self, logit_tensor):
+        """
+        Model çıktısını işler.
+        Giriş : (1, 1, H, W) ham logit tensor
+        Çıkış : prob map (H,W), binary mask (H,W)
+        """
+        prob = torch.sigmoid(logit_tensor)
+        prob_np = prob.squeeze().cpu().numpy()   # (H, W)
+        mask_np = (prob_np > self.threshold).astype(np.uint8)
+        return prob_np, mask_np
+
+    def _compute_stats(self, prob_map, binary_mask):
+        """
+        Tahmin istatistiklerini hesaplar.
+        """
+        total_pixels  = binary_mask.size
+        cavity_pixels = binary_mask.sum()
+        cavity_ratio  = cavity_pixels / total_pixels * 100
+
+        # Bağlantılı bileşen analizi (kaç ayrı çürük bölgesi)
+        num_labels, labels, stats, centroids = \
+            cv2.connectedComponentsWithStats(
+                binary_mask, connectivity=8
+            )
+        # 0 = arka plan, 1+ = çürük bölgeleri
+        num_cavities = num_labels - 1
+
+        # Her bölgenin alanı (piksel)
+        cavity_areas = []
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            cavity_areas.append(int(area))
+
+        return {
+            "cavity_detected" : cavity_pixels > 0,
+            "num_regions"     : num_cavities,
+            "cavity_pixels"   : int(cavity_pixels),
+            "total_pixels"    : int(total_pixels),
+            "cavity_ratio_pct": round(float(cavity_ratio), 3),
+            "max_prob"        : round(float(prob_map.max()), 4),
+            "mean_prob"       : round(float(prob_map.mean()), 4),
+            "region_areas_px" : cavity_areas,
+            "centroids"       : centroids[1:].tolist()
+                                if num_cavities > 0 else []
+        }
+
+    def predict(self, image_path):
+        """
+        Ana tahmin fonksiyonu.
+
+        Args:
+            image_path : PNG dosya yolu
+
+        Returns:
+            dict: {
+                image_path, img_original, img_norm,
+                prob_map, binary_mask, stats, elapsed_ms
+            }
+        """
+        t0 = time.time()
+
+        # Ön işleme
+        img_original, img_norm, tensor = \
+            self._preprocess(image_path)
+
+        # Forward pass
+        with torch.no_grad():
+            logits = self.model(tensor)
+
+        # Son işleme
+        prob_map, binary_mask = self._postprocess(logits)
+
+        # İstatistikler
+        stats = self._compute_stats(prob_map, binary_mask)
+
+        elapsed_ms = round((time.time() - t0) * 1000, 1)
+        stats["elapsed_ms"] = elapsed_ms
+
+        return {
+            "image_path"  : image_path,
+            "img_original": img_original,
+            "img_norm"    : img_norm,
+            "prob_map"    : prob_map,
+            "binary_mask" : binary_mask,
+            "stats"       : stats
+        }
+
+    def print_stats(self, result):
+        """Tahmin istatistiklerini ekrana yazar."""
+        s = result["stats"]
+        print("\n" + "=" * 50)
+        print("  ÇÜRÜK TESPİT RAPORU")
+        print("=" * 50)
+        print(f"  Dosya        : "
+              f"{os.path.basename(result['image_path'])}")
+        print(f"  Çürük Var mı : "
+              f"{'EVET ⚠️' if s['cavity_detected'] else 'HAYIR ✅'}")
+        print(f"  Bölge Sayısı : {s['num_regions']}")
+        print(f"  Çürük Alan   : {s['cavity_pixels']} piksel "
+              f"({s['cavity_ratio_pct']:.2f}%)")
+        print(f"  Maks Olasılık: {s['max_prob']:.4f}")
+        for i, area in enumerate(s["region_areas_px"]):
+            print(f"  Bölge {i+1}      : {area} piksel")
+        print(f"  Süre         : {s['elapsed_ms']} ms")
+        print("=" * 50)
+
+    def visualize(self, result,
+                   save_path=None,
+                   show=True):
+        """
+        Tahmin sonucunu 5 panelde görselleştirir:
+        1) Orijinal röntgen
+        2) Olasılık ısı haritası
+        3) Binary maske
+        4) Overlay (çürük bölge işaretli)
+        5) Bölge haritası (her bölge ayrı renk)
+        """
+        s    = result["stats"]
+        img  = result["img_norm"]
+        prob = result["prob_map"]
+        mask = result["binary_mask"]
+
+        # ── Overlay ──────────────────────────────────────────
+        overlay = img.copy()
+        if mask.sum() > 0:
+            # Çürük bölge → kırmızı tint
+            overlay[mask == 1] = (
+                overlay[mask == 1] * 0.35 +
+                np.array([1.0, 0.15, 0.15]) * 0.65
+            )
+            # Sınır konturu → sarı
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            ov_bgr = (overlay * 255).astype(np.uint8)
+            cv2.drawContours(
+                ov_bgr, contours, -1, (255, 220, 0), 2
+            )
+            # Merkez noktaları işaretle
+            for cx, cy in result["stats"]["centroids"]:
+                cv2.circle(
+                    ov_bgr,
+                    (int(cx), int(cy)), 6,
+                    (0, 255, 100), -1
+                )
+            overlay = ov_bgr / 255.0
+
+        # ── Bölge Haritası ───────────────────────────────────
+        num_labels, label_map, _, _ = \
+            cv2.connectedComponentsWithStats(mask)
+        region_colored = np.zeros(
+            (*mask.shape, 3), dtype=np.float32
+        )
+        colors = [
+            [1.0, 0.2, 0.2],
+            [0.2, 0.8, 1.0],
+            [1.0, 0.8, 0.1],
+            [0.6, 1.0, 0.2],
+            [1.0, 0.4, 1.0],
+        ]
+        for lbl in range(1, num_labels):
+            c = colors[(lbl - 1) % len(colors)]
+            region_colored[label_map == lbl] = c
+
+        # ── Çizim ────────────────────────────────────────────
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+
+        status = ("⚠️  ÇÜRÜK TESPİT EDİLDİ"
+                  if s["cavity_detected"]
+                  else "✅ SAĞLAM")
+        fig.suptitle(
+            f"{os.path.basename(result['image_path'])}  |  "
+            f"{status}  |  "
+            f"Bölge: {s['num_regions']}  |  "
+            f"Alan: {s['cavity_ratio_pct']:.2f}%  |  "
+            f"Süre: {s['elapsed_ms']}ms",
+            fontsize=12, fontweight="bold"
+        )
+
+        axes[0].imshow(img, cmap="gray")
+        axes[0].set_title("Orijinal Röntgen")
+        axes[0].axis("off")
+
+        im1 = axes[1].imshow(
+            prob, cmap="hot", vmin=0, vmax=1
+        )
+        axes[1].set_title("Çürük Olasılık Haritası")
+        axes[1].axis("off")
+        plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+        axes[2].imshow(mask, cmap="gray", vmin=0, vmax=1)
+        axes[2].set_title(
+            f"Binary Maske (thr={self.threshold})"
+        )
+        axes[2].axis("off")
+
+        axes[3].imshow(overlay)
+        axes[3].set_title("Overlay\n(Kırmızı=Çürük, Sarı=Sınır)")
+        axes[3].axis("off")
+
+        axes[4].imshow(img, cmap="gray")
+        axes[4].imshow(
+            region_colored, alpha=0.6
+        )
+        axes[4].set_title(
+            f"Bölge Haritası ({s['num_regions']} bölge)"
+        )
+        axes[4].axis("off")
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(
+                save_path, dpi=150, bbox_inches="tight"
+            )
+            print(f"[INFO] Görsel kaydedildi → {save_path}")
+
+        if show:
+            plt.show()
+        plt.close()
+
+
+# ============================================================
+# 7.2 — TOPLU INFERENCE
+# ============================================================
+
+def batch_inference(inferencer, image_dir,
+                     output_dir=OUTPUT_DIR,
+                     extensions=(".png",)):
+    """
+    Bir klasördeki tüm görüntüler için inference yapar.
+    Her görüntü için görsel + özet rapor üretir.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_files = [
+        f for f in sorted(os.listdir(image_dir))
+        if f.lower().endswith(extensions)
+    ]
+
+    if not image_files:
+        print(f"[WARN] Görüntü bulunamadı: {image_dir}")
+        return []
+
+    print(f"\n[INFO] {len(image_files)} görüntü işlenecek...")
+    print("-" * 50)
+
+    all_results = []
+
+    for i, fname in enumerate(image_files):
+        img_path  = os.path.join(image_dir, fname)
+        save_path = os.path.join(
+            output_dir,
+            fname.replace(".png", "_result.png")
+        )
+
+        try:
+            result = inferencer.predict(img_path)
+            inferencer.print_stats(result)
+            inferencer.visualize(
+                result,
+                save_path=save_path,
+                show=False          # Toplu modda ekranda açma
+            )
+            all_results.append(result)
+
+        except Exception as e:
+            print(f"[ERROR] {fname} → {e}")
+            continue
+
+        print(f"  [{i+1}/{len(image_files)}] "
+              f"{fname} tamamlandı.")
+
+    print(f"\n[DONE] {len(all_results)} görüntü işlendi.")
+    print(f"[DONE] Çıktılar → {output_dir}")
+    return all_results
+
+
+# ============================================================
+# 7.3 — ÖZET TABLO
+# ============================================================
+
+def print_summary_table(all_results):
+    """Toplu inference sonuçlarını tablo olarak gösterir."""
+
+    print("\n" + "=" * 70)
+    print(f"{'Dosya':<25} {'Çürük':^8} {'Bölge':^7} "
+          f"{'Alan%':^8} {'MaxProb':^9} {'Süre(ms)':^9}")
+    print("=" * 70)
+
+    for r in all_results:
+        s    = r["stats"]
+        name = os.path.basename(r["image_path"])[:24]
+        det  = "EVET ⚠️" if s["cavity_detected"] else "HAYIR ✅"
+        print(
+            f"{name:<25} {det:^8} "
+            f"{s['num_regions']:^7} "
+            f"{s['cavity_ratio_pct']:^8.2f} "
+            f"{s['max_prob']:^9.4f} "
+            f"{s['elapsed_ms']:^9}"
+        )
+
+    print("=" * 70)
+    total  = len(all_results)
+    cavs   = sum(
+        1 for r in all_results if r["stats"]["cavity_detected"]
+    )
+    print(f"\n  Toplam   : {total}")
+    print(f"  Çürüklü  : {cavs} ({cavs/total*100:.1f}%)")
+    print(f"  Sağlam   : {total-cavs} "
+          f"({(total-cavs)/total*100:.1f}%)")
+
+# ── Örnek 1: Tek Görüntü ────────────────────────────────────
+MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
+inferencer = DentalInference(
+    model_path=MODEL_PATH,
+    threshold=best_threshold,   # Bölüm 6'da bulunan optimal
+    device=DEVICE
+)
+
+# Klasördeki İLK görüntüyü otomatik olarak al
+test_dosyalari = os.listdir(TEST_IMAGE_DIR)
+if len(test_dosyalari) > 0:
+    ilk_dosya = sorted(test_dosyalari)[0] # Klasördeki ilk dosyayı bul
+    SAMPLE_IMAGE = os.path.join(TEST_IMAGE_DIR, ilk_dosya)
+else:
+    SAMPLE_IMAGE = "" # Klasör boşsa atla
+# Tek görüntü tahmini
+SAMPLE_IMAGE = os.path.join(TEST_IMAGE_DIR, "0001.png")
+
+if os.path.exists(SAMPLE_IMAGE):
+    result = inferencer.predict(SAMPLE_IMAGE)
+    inferencer.print_stats(result)
+    inferencer.visualize(
+        result,
+        save_path=os.path.join(OUTPUT_DIR, "sample_result.png"),
+        show=True
+    )
+
+
+# ── Örnek 2: Toplu Inference ────────────────────────────────
+print("\n[INFO] Toplu inference başlatılıyor...")
+all_results = batch_inference(
+    inferencer  = inferencer,
+    image_dir   = TEST_IMAGE_DIR,
+    output_dir  = os.path.join(OUTPUT_DIR, "inference_results")
+)
+
+# Özet tablo
+if all_results:
+    print_summary_table(all_results)
+
+
+# ── Örnek 3: Farklı Threshold Karşılaştırması ───────────────
+def compare_thresholds(inferencer, image_path,
+                        thresholds=(0.3, 0.5, 0.7)):
+    """
+    Aynı görüntüde farklı threshold değerlerini karşılaştırır.
+    """
+    result = inferencer.predict(image_path)
+    prob   = result["prob_map"]
+    img    = result["img_norm"]
+
+    fig, axes = plt.subplots(
+        1, len(thresholds) + 1,
+        figsize=(5 * (len(thresholds) + 1), 5)
+    )
+
+    axes[0].imshow(img, cmap="gray")
+    axes[0].set_title("Orijinal")
+    axes[0].axis("off")
+
+    for i, thr in enumerate(thresholds):
+        mask = (prob > thr).astype(np.uint8)
+        overlay = img.copy()
+        overlay[mask == 1] = (
+            overlay[mask == 1] * 0.4 +
+            np.array([1.0, 0.2, 0.2]) * 0.6
+        )
+        cavity_pct = mask.sum() / mask.size * 100
+
+        axes[i+1].imshow(overlay)
+        axes[i+1].set_title(
+        f"Threshold={thr}\n"
+        f"Alan={cavity_pct:.2f}%"
+        )
+        axes[i+1].axis("off")
+
+    plt.suptitle("Threshold Karşılaştırması", fontsize=13)
+    plt.tight_layout()
+
+    save_path = os.path.join(OUTPUT_DIR, "threshold_compare.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[INFO] Karşılaştırma → {save_path}")
+
+if os.path.exists(SAMPLE_IMAGE):
+    compare_thresholds(
+        inferencer, SAMPLE_IMAGE,
+        thresholds=(0.3, best_threshold, 0.7)
+    )

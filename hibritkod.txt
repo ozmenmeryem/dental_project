@@ -1,0 +1,332 @@
+# ============================================================
+# BÖLÜM 1: KÜTÜPHANELER VE YOLLAR
+# ============================================================
+import os
+import cv2
+import time
+import csv
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datetime import datetime
+from torchvision.models import efficientnet_b4
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- KAGGLE KLASÖR YOLLARI ---
+# Test görüntüleri ve maskeleri
+PATH_TEST_IMG  = "/kaggle/input/datasets/abdullahgrm/dental/test_images/test_images"
+PATH_TEST_MASK = "/kaggle/input/datasets/abdullahgrm/dental/test_masks/test_masks"
+
+# Kaggle ML Modeli Yolu (Kendi dizinine göre güncelleyebilirsin)
+# Sadece bu satırı şu şekilde güncelle:
+PATH_ML_MODEL = "/kaggle/input/notebooks/abdullahgrm/notebook12b8d20191/checkpoints/best_model.pth" 
+
+# Çıktı klasörü (Kaggle Working)
+PATH_DEBUG_OUT = "/kaggle/working/Hibrit_Sonuclar"
+os.makedirs(PATH_DEBUG_OUT, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ML_THRESHOLD = 0.35 # Eğitimin sonunda bulduğumuz optimal eşik
+
+# ============================================================
+# BÖLÜM 2: ML MODEL MİMARİSİ
+# ============================================================
+class ConvBnRelu(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel=3, padding=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel, padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.conv = nn.Sequential(
+            ConvBnRelu(in_ch + skip_ch, out_ch),
+            ConvBnRelu(out_ch, out_ch)
+        )
+
+    def forward(self, x, skip=None):
+        x = self.up(x)
+        if skip is not None:
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=True)
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_ch, out_ch=256):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=12, dilation=12, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=18, dilation=18, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * 5, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5)
+        )
+
+    def forward(self, x):
+        size = x.shape[2:]
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+        x5 = F.interpolate(self.pool(x), size=size, mode="bilinear", align_corners=True)
+        return self.project(torch.cat([x1, x2, x3, x4, x5], dim=1))
+
+
+class DentalSegNet(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        backbone = efficientnet_b4(pretrained=False) # Inference için False
+        self.encoder = backbone.features
+
+        self.aspp = ASPP(in_ch=1792, out_ch=256)
+
+        self.dec5 = DecoderBlock(256, 112, 128)
+        self.dec4 = DecoderBlock(128,  56,  64)
+        self.dec3 = DecoderBlock( 64,  32,  32)
+        self.dec2 = DecoderBlock( 32,  24,  16)
+        self.dec1 = DecoderBlock( 16,   0,   8)
+
+        self.s1_conv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            ConvBnRelu(48, 8)
+        )
+
+        self.dec0_conv = nn.Sequential(
+            ConvBnRelu(8 + 8, 8),
+            ConvBnRelu(8, 8)
+        )
+
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(8, 8, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, num_classes, kernel_size=1)
+        )
+
+        self.dropout = nn.Dropout2d(p=0.3)
+
+    def forward(self, x):
+        skips = {}
+        for i, block in enumerate(self.encoder):
+            x = block(x)
+            if i == 0: skips["s1"] = x
+            elif i == 1: skips["s2"] = x
+            elif i == 2: skips["s3"] = x
+            elif i == 3: skips["s4"] = x
+            elif i == 4: skips["s5"] = x
+                
+        x = self.aspp(x)
+        x = self.dropout(x)
+        
+        x = self.dec5(x, skips["s5"])
+        x = self.dec4(x, skips["s4"])
+        x = self.dec3(x, skips["s3"])
+        x = self.dec2(x, skips["s2"])
+        x = self.dec1(x, None)
+        
+        s1_up = self.s1_conv(skips["s1"])
+        x = torch.cat([x, s1_up], dim=1)
+        x = self.dec0_conv(x)
+        
+        return self.seg_head(x)
+# ============================================================
+# BÖLÜM 3: HİBRİT MOTORU (ALTIN ORAN - YÜKSEK PREC & REC)
+# ============================================================
+class HybridEngine:
+    def __init__(self, model_path, device):
+        self.device = device
+        self.ml_model = DentalSegNet().to(device)
+        self.ml_model.eval()
+        
+        if os.path.exists(model_path):
+            ckpt = torch.load(model_path, map_location=device)
+            self.ml_model.load_state_dict(ckpt["model_state"])
+            print(f"[INFO] ML Modeli yüklendi: {model_path}")
+        else:
+            print(f"[HATA] ML Modeli bulunamadı! Yol: {model_path}")
+
+    def get_ml_mask(self, img_bgr):
+        # Kaggle'daki ML boyutuna getir (512x512)
+        img_resized = cv2.resize(img_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_norm = img_rgb.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(np.transpose(img_norm, (2, 0, 1))).unsqueeze(0).to(self.device)
+
+        # TTA (Test-Time Augmentation) ile Kararlı Tahmin
+        with torch.no_grad():
+            logits1 = self.ml_model(tensor)
+            prob1 = torch.sigmoid(logits1).squeeze().cpu().numpy()
+            
+            tensor_flipped = torch.flip(tensor, dims=[3])
+            logits2 = self.ml_model(tensor_flipped)
+            prob2_flipped = torch.sigmoid(logits2).squeeze().cpu().numpy()
+            
+            prob2 = np.fliplr(prob2_flipped)
+            prob_final = (prob1 + prob2) / 2.0
+            
+        mask_binary = (prob_final > ML_THRESHOLD).astype(np.uint8) * 255
+        return cv2.resize(mask_binary, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    def get_rule_based_mask(self, img_gray):
+        proc_img = cv2.GaussianBlur(img_gray, (5,5), 0)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        proc_img = clahe.apply(proc_img)
+        thresh = cv2.adaptiveThreshold(proc_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 45, 5)
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel_dilate)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
+        
+        rule_mask = np.zeros_like(img_gray, dtype=np.uint8)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 10:
+                cv2.drawContours(rule_mask, [cnt], -1, 255, cv2.FILLED)
+        return rule_mask
+
+    def get_hybrid_mask(self, img_bgr, img_gray):
+        rule_mask = self.get_rule_based_mask(img_gray)
+        ml_mask = self.get_ml_mask(img_bgr)
+        
+        # 1. OPTİMİZASYON: Kontrollü Esnetme (Sweet Spot)
+        # 15x15 yerine 7x7 kullanıyoruz. Recall'u yüksek tutarken Precision'ı kurtarır.
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        ml_dilated = cv2.dilate(ml_mask, kernel_dilate, iterations=1)
+        
+        hybrid_mask = cv2.bitwise_and(rule_mask, ml_dilated)
+        
+        # 2. OPTİMİZASYON: Agresif Gürültü Filtresi (Sıfır Tolerans)
+        # 50 pikselden 100 piksele çıkardık. Yanlış alarmları (False Positive) keser atar.
+        clean_mask = np.zeros_like(hybrid_mask)
+        contours, _ = cv2.findContours(hybrid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 100:  
+                cv2.drawContours(clean_mask, [cnt], -1, 255, cv2.FILLED)
+                
+        # 3. YENİ OPTİMİZASYON: Morfolojik Kapatma (F1 / IoU Roketi)
+        # Çürüğün içindeki ufak boşlukları ve delikleri doldurur, maskeyi tek parça yapar.
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        final_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close)
+        
+        return rule_mask, ml_mask, final_mask
+
+# ============================================================
+# BÖLÜM 4: ANA ÇALIŞTIRICI VE RAPORLAMA
+# ============================================================
+def process_hybrid():
+    now = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    rapor_path = os.path.join(PATH_DEBUG_OUT, f"Hibrit_Analiz_Raporu_ALTIN_ORAN_{now}.csv")
+    
+    engine = HybridEngine(PATH_ML_MODEL, DEVICE)
+    print("\n[INFO] ALTIN ORAN HİBRİT MOD (TTA + Sweet Spot ROI + Aggressive Clean + Close) BAŞLATILDI...")
+
+    islenen_dosya = 0
+    sum_iou = 0; sum_dice = 0; sum_precision = 0; sum_recall = 0; sum_f1 = 0
+    
+    with open(rapor_path, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Dosya", "IoU", "Dice", "Precision", "Recall", "F1", "Islem_Suresi_ms"])
+
+        for filename_with_ext in os.listdir(PATH_TEST_IMG):
+            if not filename_with_ext.lower().endswith(('.png', '.jpg')): continue
+                
+            filename = os.path.splitext(filename_with_ext)[0]
+            img_path = os.path.join(PATH_TEST_IMG, filename_with_ext)
+            
+            mask_path = None
+            for ext in ['.png', '.PNG', '.jpg']:
+                if os.path.exists(os.path.join(PATH_TEST_MASK, f"{filename}{ext}")):
+                    mask_path = os.path.join(PATH_TEST_MASK, f"{filename}{ext}")
+                    break
+                elif os.path.exists(os.path.join(PATH_TEST_MASK, f"{filename}_mask{ext}")):
+                    mask_path = os.path.join(PATH_TEST_MASK, f"{filename}_mask{ext}")
+                    break
+
+            if not mask_path: continue
+
+            img_array = np.fromfile(img_path, np.uint8)
+            img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            
+            mask_array = np.fromfile(mask_path, np.uint8)
+            gt_mask = cv2.imdecode(mask_array, cv2.IMREAD_GRAYSCALE)
+            _, gt_mask = cv2.threshold(gt_mask, 127, 255, cv2.THRESH_BINARY)
+            
+            start_time = time.perf_counter()
+            _, _, final_hybrid_mask = engine.get_hybrid_mask(img_bgr, img_gray)
+            ms = int((time.perf_counter() - start_time) * 1000)
+
+            intersection = cv2.bitwise_and(final_hybrid_mask, gt_mask)
+            TP = cv2.countNonZero(intersection)
+            FP = cv2.countNonZero(final_hybrid_mask) - TP
+            FN = cv2.countNonZero(gt_mask) - TP
+
+            iou = TP/(TP+FP+FN) if (TP+FP+FN)>0 else 0
+            dice = (2*TP)/(2*TP+FP+FN) if (2*TP+FP+FN)>0 else 0
+            precision = TP/(TP+FP) if (TP+FP)>0 else 0
+            recall = TP/(TP+FN) if (TP+FN)>0 else 0
+            f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0
+
+            sum_iou += iou; sum_dice += dice; sum_precision += precision
+            sum_recall += recall; sum_f1 += f1
+            islenen_dosya += 1
+
+            writer.writerow([filename, round(iou,4), round(dice,4), round(precision,4), round(recall,4), round(f1,4), ms])
+            
+            if islenen_dosya % 50 == 0:
+                print(f" İşlenen: {islenen_dosya} | Altın Prec: {precision:.2f} | Altın Rec: {recall:.2f}")
+
+        if islenen_dosya > 0:
+            writer.writerow([])
+            writer.writerow(["ALTIN ORAN ORTALAMA HIBRIT PERFORMANS"])
+            writer.writerow(["IoU", round(sum_iou/islenen_dosya, 4), "Dice", round(sum_dice/islenen_dosya, 4),
+                             "Precision", round(sum_precision/islenen_dosya, 4), "Recall", round(sum_recall/islenen_dosya, 4),
+                             "F1", round(sum_f1/islenen_dosya, 4)])
+
+    print("\n" + "="*60)
+    print(f"[BAŞARILI] Altın Oran Hibrit İşlem Tamamlandı. ({islenen_dosya} Görüntü)")
+    print(f"Rapor Yolu: {rapor_path}")
+    print("="*60)
+
+if __name__ == "__main__":
+    process_hybrid()
