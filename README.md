@@ -33,9 +33,6 @@ Bu proje, panoramik dental röntgen görüntülerinde diş çürüklerini tespit
 3. Uygulamayı başlatın:
    python main_ui.py
 
-## Performans
-Sistem, test veri setleri üzerinde yüksek Dice ve IoU skorları elde ederek klinik karar destek mekanizması olarak kullanılabilirliğini kanıtlamıştır. Özellikle hibrit yaklaşım, yanlış pozitif oranlarını minimize etmektedir.
-
 ## 📊 Performans ve Metrik Analizi
 
 Projenin başarısı, test veri seti üzerinde standart tıbbi görüntüleme metrikleri kullanılarak ölçülmüştür. Hibrit modelimiz, sadece ML veya sadece kural tabanlı sistemlere göre daha dengeli sonuçlar vermektedir.
